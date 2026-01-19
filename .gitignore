@@ -1,0 +1,15 @@
+# Environment variables
+.env
+
+# Output directory
+output/
+
+# Python / UV / Virtualenv
+__pycache__/
+*.pyc
+.venv/
+.python-version
+uv.lock
+
+# OS custom
+.DS_Store
