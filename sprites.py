@@ -11,9 +11,14 @@ from tqdm import tqdm
 from PIL import Image
 from rembg import remove
 from google import genai
-from google import genai
 from google.genai import types
 from dotenv import load_dotenv, set_key
+import uuid
+import json
+import urllib.request
+import urllib.parse
+import websocket
+import random
 
 load_dotenv()
 
@@ -27,20 +32,155 @@ EMOTIONS = [
     "sadness", "surprise", "blush"
 ]
 
+class ComfyUIBackend:
+    def __init__(self, server_address):
+        self.server_address = server_address
+        self.client_id = str(uuid.uuid4())
+        self.ws = websocket.WebSocket()
+        self.ws.connect("ws://{}/ws?clientId={}".format(self.server_address, self.client_id))
+
+    def queue_prompt(self, prompt):
+        p = {"prompt": prompt, "client_id": self.client_id}
+        data = json.dumps(p).encode('utf-8')
+        req =  urllib.request.Request("http://{}/prompt".format(self.server_address), data=data)
+        return json.loads(urllib.request.urlopen(req).read())
+
+    def get_image(self, filename, subfolder, folder_type):
+        data = {"filename": filename, "subfolder": subfolder, "type": folder_type}
+        url_values = urllib.parse.urlencode(data)
+        with urllib.request.urlopen("http://{}/view?{}".format(self.server_address, url_values)) as response:
+            return response.read()
+
+    def get_history(self, prompt_id):
+        with urllib.request.urlopen("http://{}/history/{}".format(self.server_address, prompt_id)) as response:
+             return json.loads(response.read())
+
+    def upload_image(self, image_data, name="upload_image"):
+        import requests
+        url = "http://{}/upload/image".format(self.server_address)
+        files = {'image': (name, image_data)}
+        response = requests.post(url, files=files)
+        return response.json()
+    
+    def get_images(self, ws, prompt):
+        prompt_id = self.queue_prompt(prompt)['prompt_id']
+        output_images = {}
+        while True:
+            out = ws.recv()
+            if isinstance(out, str):
+                message = json.loads(out)
+                if message['type'] == 'executing':
+                    data = message['data']
+                    if data['node'] is None and data['prompt_id'] == prompt_id:
+                        break #Execution is done
+            else:
+                continue #previews
+
+        history = self.get_history(prompt_id)[prompt_id]
+        for node_id in history['outputs']:
+            node_output = history['outputs'][node_id]
+            if 'images' in node_output:
+                images_output = []
+                for image in node_output['images']:
+                    image_data = self.get_image(image['filename'], image['subfolder'], image['type'])
+                    images_output.append(image_data)
+                output_images[node_id] = images_output
+
+        return output_images
+
+    def generate(self, workflow, anchor_bytes, emotion, dramatic_pose=False):
+        # 1. Upload Anchor Image
+        filename = f"anchor_{self.client_id}.png"
+        upload_resp = self.upload_image(anchor_bytes, filename)
+        upload_name = upload_resp.get("name")
+
+        # 2. Modify Workflow
+        workflow = json.loads(json.dumps(workflow)) # Deep copy
+        
+        load_image_node = None
+        clip_text_node = None
+        
+        for node_id, node in workflow.items():
+            if node["class_type"] == "LoadImage":
+                load_image_node = node
+            # Try to find a positive prompt Text Encode node
+            if (node["class_type"] == "CLIPTextEncode" or node["class_type"] == "BNK_CLIPTextEncode"):
+                text = node["inputs"].get("text", "").lower()
+                if "negative" not in text and "bad" not in text:
+                     clip_text_node = node
+
+        if load_image_node:
+             load_image_node["inputs"]["image"] = upload_name
+        
+        if clip_text_node:
+             pose_instruction = ""
+             if dramatic_pose:
+                 pose_instruction = "dramatic pose, expressive, "
+             
+             prompt_addition = f"expression: {emotion}, {pose_instruction}"
+             
+             # Support placeholder or append
+             current_text = clip_text_node["inputs"]["text"]
+             if "{emotion}" in current_text:
+                 clip_text_node["inputs"]["text"] = current_text.replace("{emotion}", emotion)
+             else:
+                 clip_text_node["inputs"]["text"] = f"{current_text}, {prompt_addition}"
+
+        # 3. Generate
+        try:
+             images = self.get_images(self.ws, workflow)
+             for node_id, image_list in images.items():
+                 if image_list:
+                     return image_list[0]
+        except Exception as e:
+             print(f"ComfyUI Error: {e}")
+             return None
+        return None
+
 def remove_background(image_bytes: bytes) -> bytes:
     """Removes the background from image bytes using rembg."""
     return remove(image_bytes)
 
 async def generate_expression(
-    client: genai.Client,
+    client: genai.Client | ComfyUIBackend,
     anchor_image_bytes: bytes,
     emotion: str,
     output_path: Path,
     model_name: str = "gemini-2.5-flash-image",
     dramatic_pose: bool = False,
+    backend_type: str = "gemini",
+    workflow: dict = None,
 ):
-    """Sends the anchor image to Gemini to generate a specific expression."""
+    """Sends the anchor image to Gemini or ComfyUI to generate a specific expression."""
     
+    if backend_type == "comfyui":
+        if not workflow:
+            print("Error: ComfyUI backend selected but no workflow provided.")
+            return None
+        
+        # Run in executor to avoid blocking asyncio loop since ComfyUIBackend is synchronous (urllib/websocket)
+        loop = asyncio.get_running_loop()
+        generated_bytes = await loop.run_in_executor(
+            None, 
+            client.generate, 
+            workflow, 
+            anchor_image_bytes, 
+            emotion, 
+            dramatic_pose
+        )
+        
+        if not generated_bytes:
+            print(f"ComfyUI returned no image for {emotion}")
+            return None
+            
+        final_bytes = remove_background(generated_bytes)
+        img = Image.open(io.BytesIO(final_bytes))
+        if output_path:
+            img.save(output_path, format="WEBP")
+        return img
+
+
+    # GEMINI IMPLEMENTATION
     if dramatic_pose:
         pose_instruction = f"Change the pose to be dramatic and expressive to match the {emotion}. Maintain character costume and lighting details."
     else:
@@ -53,10 +193,6 @@ async def generate_expression(
     )
 
     try:
-        # Safety settings to prevent blocking
-        # Note: Adjust fields as per the latest SDK spec if needed, but BLOCK_NONE is standard target
-        # For google-genai SDK 0.x/1.x, we assume standard config keys.
-        
         response = client.models.generate_content(
             model=model_name,
             contents=[prompt, types.Part.from_bytes(data=anchor_image_bytes, mime_type="image/png")],
@@ -88,9 +224,6 @@ async def generate_expression(
 
         if not response.candidates or not response.candidates[0].content or not response.candidates[0].content.parts:
             print(f"No content parts returned for {emotion}.")
-            if response.candidates:
-                print(f"Finish Reason: {response.candidates[0].finish_reason}")
-                print(f"Safety Ratings: {response.candidates[0].safety_ratings}")
             return None
 
         image_part = next((part for part in response.candidates[0].content.parts if part.inline_data), None)
@@ -113,22 +246,41 @@ async def generate_expression(
             
     except Exception as e:
         print(f"Failed to generate {emotion}: {e}")
-        try:
-            print(f"Response debug: {response}")
-        except:
-            print("Response not available")
-        # traceback.print_exc() # Reduce noise for now
         return None
 
-async def run_batch_generation(api_key, anchor_image, name, model_choice, dramatic_pose):
-    if not api_key:
-        yield [], "Error: API Key is required."
-        return
+async def run_batch_generation(api_key, anchor_image, name, model_choice, dramatic_pose, backend_choice, comfy_url, workflow_file):
+    if backend_choice == "Gemini":
+        if not api_key:
+            yield [], "Error: API Key is required for Gemini."
+            return
+        client = genai.Client(api_key=api_key)
+        workflow = None
+        backend_type = "gemini"
+    else:
+        # ComfyUI
+        if not comfy_url:
+            yield [], "Error: ComfyUI URL is required."
+            return
+        if not workflow_file:
+            yield [], "Error: Workflow file (JSON API format) is required for ComfyUI."
+            return
+        
+        try:
+             # Load workflow JSON
+             # workflow_file is a NamedString or temp file path from Gradio
+             with open(workflow_file.name, 'r') as f:
+                 workflow = json.load(f)
+        except Exception as e:
+            yield [], f"Error loading workflow: {e}"
+            return
+
+        client = ComfyUIBackend(comfy_url.replace("http://", "").replace("https://", "").replace("/", ""))
+        backend_type = "comfyui"
+
     if anchor_image is None:
         yield [], "Error: Anchor image is required."
         return
     
-    client = genai.Client(api_key=api_key)
     output_dir = Path("./output") / name
     output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -173,7 +325,16 @@ async def run_batch_generation(api_key, anchor_image, name, model_choice, dramat
                 pass
             continue
 
-        img = await generate_expression(client, anchor_bytes, emotion, output_file, model_choice, dramatic_pose)
+        img = await generate_expression(
+            client, 
+            anchor_bytes, 
+            emotion, 
+            output_file, 
+            model_choice, 
+            dramatic_pose, 
+            backend_type=backend_type,
+            workflow=workflow
+        )
         
         if img:
             processed.append(img)
@@ -235,19 +396,60 @@ def gui():
     """Launch the Gradio Web UI."""
     with gr.Blocks(title="SillyTavern Sprite Generator") as demo:
         gr.Markdown("# 🎭 SillyTavern Sprite Generator")
-        gr.Markdown("Generate all character expressions from a single image using Gemini.")
+        gr.Markdown("Generate all character expressions from a single image using Gemini or Local ComfyUI.")
         
         with gr.Row():
             with gr.Column():
-                api_key = gr.Textbox(label="Google API Key", placeholder="Paste your GOOGLE_API_KEY here", type="password", value=os.getenv("GOOGLE_API_KEY", ""))
-                char_name = gr.Textbox(label="Character Name", placeholder="e.g. Vesper")
-                model_name = gr.Dropdown(
-                    choices=["gemini-2.5-flash-image", "gemini-2.0-flash-exp", "gemini-3.0-pro-image-exp"], 
-                    value="gemini-2.5-flash-image", 
-                    label="Model"
+                backend_choice = gr.Radio(
+                    choices=["Gemini", "ComfyUI"], 
+                    value="Gemini", 
+                    label="Backend"
                 )
+                
+                # Gemini Controls
+                with gr.Group(visible=True) as gemini_group:
+                    api_key = gr.Textbox(
+                        label="Google API Key", 
+                        placeholder="Paste your GOOGLE_API_KEY here", 
+                        type="password", 
+                        value=os.getenv("GOOGLE_API_KEY", "")
+                    )
+                    model_name = gr.Dropdown(
+                        choices=["gemini-2.5-flash-image", "gemini-2.0-flash-exp", "gemini-3.0-pro-image-exp"], 
+                        value="gemini-2.5-flash-image", 
+                        label="Model"
+                    )
+
+                # ComfyUI Controls
+                with gr.Group(visible=False) as comfy_group:
+                    comfy_url = gr.Textbox(
+                        label="ComfyUI URL", 
+                        value="127.0.0.1:8188", 
+                        placeholder="e.g. 127.0.0.1:8188"
+                    )
+                    workflow_file = gr.File(
+                        label="Workflow API JSON", 
+                        file_types=[".json"],
+                        file_count="single"
+                    )
+                    gr.Markdown("ℹ️ **Note:** Workflow must be in **API Format** (Enable Dev Mode in ComfyUI -> Save (API Format)). It must have a 'Load Image' node.")
+
+                def toggle_backend(choice):
+                    return {
+                        gemini_group: gr.update(visible=(choice == "Gemini")),
+                        comfy_group: gr.update(visible=(choice == "ComfyUI"))
+                    }
+
+                backend_choice.change(
+                    fn=toggle_backend,
+                    inputs=[backend_choice],
+                    outputs=[gemini_group, comfy_group]
+                )
+
+                char_name = gr.Textbox(label="Character Name", placeholder="e.g. Vesper")
                 dramatic_pose = gr.Checkbox(label="Enable Dramatic Poses", value=False)
                 anchor_img = gr.Image(label="Anchor Image", type="pil")
+                
                 btn = gr.Button("🚀 Generate Sprites", variant="primary")
                 stop_btn = gr.Button("🛑 Stop", variant="stop")
                 status_msg = gr.Textbox(label="Status", interactive=False)
@@ -257,7 +459,16 @@ def gui():
         
         generate_event = btn.click(
             fn=run_batch_generation, 
-            inputs=[api_key, anchor_img, char_name, model_name, dramatic_pose], 
+            inputs=[
+                api_key, 
+                anchor_img, 
+                char_name, 
+                model_name, 
+                dramatic_pose,
+                backend_choice,
+                comfy_url,
+                workflow_file
+            ], 
             outputs=[gallery, status_msg]
         )
         

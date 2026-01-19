@@ -316,6 +316,8 @@ urllib3==2.6.3
     # via requests
 uvicorn==0.39.0
     # via gradio
+websocket-client==1.9.0
+    # via silly-sprites
 websockets==15.0.1
     # via
     #   google-genai
