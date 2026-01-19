@@ -72,6 +72,10 @@ You can also run it from the command line:
 uv run sprites.py generate ./path/to/character.png --name "Vesper" --api-key "YOUR_KEY"
 ```
 
+### Mac App
+
+Want a clickable icon in your Dock? Check out [MACOS_SETUP.md](MACOS_SETUP.md).
+
 ## Requirements
 
 - Python 3.11+
