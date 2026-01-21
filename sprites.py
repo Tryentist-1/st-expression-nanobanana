@@ -66,13 +66,20 @@ class ComfyUIBackend:
         prompt_id = self.queue_prompt(prompt)['prompt_id']
         output_images = {}
         while True:
-            out = ws.recv()
-            if isinstance(out, str):
-                message = json.loads(out)
-                if message['type'] == 'executing':
-                    data = message['data']
-                    if data['node'] is None and data['prompt_id'] == prompt_id:
-                        break #Execution is done
+            try:
+                out = ws.recv()
+                if isinstance(out, str):
+                    message = json.loads(out)
+                    if message['type'] == 'executing':
+                        data = message['data']
+                        if data['node'] is None and data['prompt_id'] == prompt_id:
+                            break #Execution is done
+                    elif message['type'] == 'execution_error':
+                         print(f"ComfyUI Execution Error: {message['data']}")
+                         raise Exception(f"ComfyUI Error: {message['data']}")
+            except Exception as e:
+                print(f"Socket receive error: {e}")
+                raise e
             else:
                 continue #previews
 
@@ -305,50 +312,57 @@ async def run_batch_generation(api_key, anchor_image, name, model_choice, dramat
     consecutive_failures = 0
     max_failures = 3
 
-    for emotion in EMOTIONS:
-        if consecutive_failures >= max_failures:
-            print(f"Stopping generation: {max_failures} consecutive failures (likely safety refusals).")
-            yield processed, f"Stopped: {max_failures} consecutive failures (likely blocked by safety)."
-            break
+    import traceback
+    try:
+        for emotion in EMOTIONS:
+            if consecutive_failures >= max_failures:
+                print(f"Stopping generation: {max_failures} consecutive failures.")
+                yield processed, f"Stopped: {max_failures} consecutive failures (check logs for errors)."
+                break
 
-        print(f"Processing {emotion}...")
-        output_file = output_dir / f"{emotion.lower()}.webp"
-        
-        if output_file.exists():
-            print(f"Skipping {emotion} (already exists)")
-            yield processed, f"Skipping {emotion} (already exists)... ({len(processed)}/{len(EMOTIONS)})"
-            # Load existing image to show in gallery
-            try:
-                existing_img = Image.open(output_file)
-                processed.append(existing_img)
-            except:
-                pass
-            continue
+            print(f"Processing {emotion}...")
+            output_file = output_dir / f"{emotion.lower()}.webp"
+            
+            if output_file.exists():
+                print(f"Skipping {emotion} (already exists)")
+                yield processed, f"Skipping {emotion} (already exists)... ({len(processed)}/{len(EMOTIONS)})"
+                # Load existing image to show in gallery
+                try:
+                    existing_img = Image.open(output_file)
+                    processed.append(existing_img)
+                except:
+                    pass
+                continue
 
-        img = await generate_expression(
-            client, 
-            anchor_bytes, 
-            emotion, 
-            output_file, 
-            model_choice, 
-            dramatic_pose, 
-            backend_type=backend_type,
-            workflow=workflow
-        )
-        
-        if img:
-            processed.append(img)
-            consecutive_failures = 0
-        else:
-            consecutive_failures += 1
-        
-        # Yield current list of images and status
-        yield processed, f"Generating... ({len(processed)}/{len(EMOTIONS)})"
-        
-        # Rate limiting
-        time.sleep(5) 
-        
-    yield processed, "Done!"
+            img = await generate_expression(
+                client, 
+                anchor_bytes, 
+                emotion, 
+                output_file, 
+                model_choice, 
+                dramatic_pose, 
+                backend_type=backend_type,
+                workflow=workflow
+            )
+            
+            if img:
+                processed.append(img)
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+            
+            # Yield current list of images and status
+            yield processed, f"Generating... ({len(processed)}/{len(EMOTIONS)})"
+            
+            # Rate limiting
+            time.sleep(10) 
+            
+        yield processed, "Done!"
+
+    except Exception as e:
+        print(f"CRITICAL ERROR in run_batch_generation: {e}")
+        traceback.print_exc()
+        yield processed, f"Error: {e}"
 
 @app.command()
 def generate(
@@ -357,6 +371,9 @@ def generate(
     api_key: Optional[str] = typer.Option(None, envvar="GOOGLE_API_KEY", help="Google GenAI API Key"),
     model: str = typer.Option("gemini-2.5-flash-image", "--model", help="Gemini model to use"),
     dramatic: bool = typer.Option(False, "--dramatic", "-d", help="Enable dramatic poses matching the emotion"),
+    backend: str = typer.Option("gemini", "--backend", "-b", help="Backend to use: gemini or comfyui"),
+    comfy_url: str = typer.Option("127.0.0.1:8188", "--comfy-url", help="ComfyUI URL"),
+    workflow: Optional[Path] = typer.Option(None, "--workflow", "-w", help="Path to ComfyUI Workflow API JSON"),
 ):
     """
     Generate SillyTavern expression sprites from a single anchor image.
@@ -365,18 +382,45 @@ def generate(
         typer.echo(f"Error: Anchor image not found at {anchor}")
         raise typer.Exit(1)
 
-    if not api_key:
+    backend_choice = "Gemini" if backend.lower() == "gemini" else "ComfyUI"
+    
+    # Mock file object for run_batch_generation if workflow path is provided
+    workflow_file = None
+    if workflow:
+        if not workflow.exists():
+             typer.echo(f"Error: Workflow file not found at {workflow}")
+             raise typer.Exit(1)
+        # Create a simple object with a .name attribute to mimic Gradio file object
+        class FileObj:
+            def __init__(self, path): self.name = str(path)
+        workflow_file = FileObj(workflow)
+
+    if backend_choice == "Gemini" and not api_key:
         typer.echo("Error: Google API Key is required. Set GOOGLE_API_KEY env var or use --api-key.")
         raise typer.Exit(1)
 
-    client = genai.Client(api_key=api_key)
+    # Re-using the logic from run_batch_generation is tricky because it yields.
+    # We should just copy the setup logic or refactor. 
+    # For CLI, we'll just instantiate and call generate_expression directly loop.
+    
+    if backend_choice == "ComfyUI":
+         if not workflow:
+              typer.echo("Error: --workflow JSON file is required for ComfyUI.")
+              raise typer.Exit(1)
+         client = ComfyUIBackend(comfy_url.replace("http://", "").replace("https://", "").replace("/", ""))
+         with open(workflow, 'r') as f:
+             workflow_data = json.load(f)
+    else:
+         client = genai.Client(api_key=api_key)
+         workflow_data = None
+
     output_dir = Path("./output") / name
     output_dir.mkdir(parents=True, exist_ok=True)
 
     with open(anchor, "rb") as f:
         anchor_bytes = f.read()
 
-    typer.echo(f"Generating sprites for {name} using {model}...")
+    typer.echo(f"Generating sprites for {name} using {backend_choice}...")
 
     async def process_all():
         for emotion in tqdm(EMOTIONS, desc="Generating Emotions"):
@@ -385,7 +429,16 @@ def generate(
                 tqdm.write(f"Skipping {emotion} - already exists.")
                 continue
             
-            await generate_expression(client, anchor_bytes, emotion, output_file, model, dramatic)
+            await generate_expression(
+                client, 
+                anchor_bytes, 
+                emotion, 
+                output_file, 
+                model, 
+                dramatic, 
+                backend_type=backend.lower(),
+                workflow=workflow_data
+            )
             time.sleep(5) # Rate limiting
 
     asyncio.run(process_all())
